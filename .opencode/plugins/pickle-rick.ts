@@ -26,7 +26,20 @@ function mapMessage(m: any) {
       : m?.type === "user"
         ? [{ type: "text", text: m.text }]
         : []
-  return { info: { role, id: m?.id, time: m?.time, error: err, agent: m?.agent, model: m?.model }, parts }
+  return {
+    info: {
+      role,
+      id: m?.id,
+      time: m?.time,
+      error: err,
+      agent: m?.agent,
+      model: m?.model,
+      finish: m?.finish,
+      tokens: m?.tokens,
+      cost: m?.cost,
+    },
+    parts,
+  }
 }
 
 const textOfParts = (parts: any[]) => (parts ?? []).filter((p: any) => p?.type === "text").map((p: any) => p.text).join("\n")
@@ -72,6 +85,7 @@ function makeV1Client(ctx: any) {
         const text = textOfParts(body?.parts)
         // v2 keeps agent/model on the session; only switch when explicitly asked.
         if (body?.agent) { try { await ctx.session.switchAgent({ sessionID, agent: body.agent }) } catch {} }
+        if (body?.model?.id && body?.model?.providerID) { try { await ctx.session.switchModel({ sessionID, model: body.model }) } catch {} }
         let beforeID: string | undefined
         try {
           const cur: any[] = (await ctx.session.context({ sessionID })) ?? []
@@ -87,9 +101,20 @@ function makeV1Client(ctx: any) {
         const msgs: any[] = (await ctx.session.context({ sessionID: path.id })) ?? []
         return { data: msgs.map(mapMessage) }
       },
-      // V1: {body:{parentID,title}} -> {data:{id,...}}.
+      // V1: {body:{parentID,title}} -> {data:{id,...}}. v2 also accepts agent and
+      // model, which is how a Morty child inherits the parent's model instead of
+      // silently falling back to the global default.
       async create({ body }: any) {
-        const created = await ctx.session.create({ parentID: body?.parentID, title: body?.title })
+        const created = await ctx.session.create({
+          parentID: body?.parentID,
+          title: body?.title,
+          agent: body?.agent,
+          model: body?.model,
+        })
+        // Belt and braces: if create ignored the model, switch afterwards.
+        if (created?.id && body?.model?.id && body?.model?.providerID) {
+          try { await ctx.session.switchModel({ sessionID: created.id, model: body.model }) } catch {}
+        }
         return { data: created }
       },
       // V1 abort -> v2 interrupt.

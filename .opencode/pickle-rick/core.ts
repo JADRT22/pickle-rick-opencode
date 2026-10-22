@@ -6,6 +6,17 @@ import path from "node:path"
 export const PHASES = ["prd", "breakdown", "research", "plan", "implement", "refactor"] as const
 export type Phase = (typeof PHASES)[number]
 
+export interface TokenTotals {
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+  // Billable new tokens: input + output + reasoning. Cache reads/writes are kept
+  // separate because providers bill them at a different rate.
+  total: number
+}
+
 export interface LoopState {
   id: string
   name: string
@@ -15,6 +26,7 @@ export interface LoopState {
   iteration: number
   maxIterations: number
   maxTimeMs: number
+  maxTokens: number
   workerTimeoutMs: number
   completionPromise: string
   phase: Phase
@@ -23,12 +35,16 @@ export interface LoopState {
   lastHandledMessageID?: string
   stopReason?: string
   jar?: boolean
+  tokensUsed?: TokenTotals
+  lastTurnTokens?: number
+  mortyTokens?: number
 }
 
 export interface ParsedArgs {
   task: string
   maxIterations?: number
   maxTimeMin?: number
+  maxTokens?: number
   workerTimeoutSec?: number
   name?: string
   completionPromise?: string
@@ -37,7 +53,7 @@ export interface ParsedArgs {
   errors: string[]
 }
 
-const DEFAULTS = { maxIterations: 5, maxTimeMin: 60, workerTimeoutSec: 1200, promise: "DONE" }
+const DEFAULTS = { maxIterations: 5, maxTimeMin: 60, maxTokens: 2_000_000, workerTimeoutSec: 1200, promise: "DONE" }
 const HARD_CAP_ITERATIONS = 100
 const unwrap = (r: any) => (r && typeof r === "object" && "data" in r ? r.data : r)
 
@@ -101,6 +117,13 @@ export function parseArgs(raw: string): ParsedArgs {
     switch (t) {
       case "--max-iterations": res.maxIterations = num(t, val()); break
       case "--max-time": res.maxTimeMin = num(t, val()); break
+      case "--max-tokens": {
+        const v = val()
+        const n = parseTokenLimit(v)
+        if (n === undefined) res.errors.push(`${t} needs a number like 500k or 2m, or "off" (got "${v ?? ""}")`)
+        else res.maxTokens = n
+        break
+      }
       case "--worker-timeout": res.workerTimeoutSec = num(t, val()); break
       case "--name": res.name = val(); break
       case "--completion-promise": res.completionPromise = val(); break
@@ -128,6 +151,45 @@ export function extractPromise(text: string): string | null {
   return m.length ? m[m.length - 1][1].trim() : null
 }
 
+// "500k" / "1.5m" / "200000" / "off" -> absolute token limit. Returns undefined
+// when the value is not a valid limit, so the caller can report a usage error.
+export function parseTokenLimit(v: string | undefined): number | undefined {
+  const s = String(v ?? "").trim().toLowerCase()
+  if (!s) return undefined
+  if (["off", "none", "unlimited", "0"].includes(s)) return 0
+  const m = /^(\d+(?:\.\d+)?)([km])?$/.exec(s)
+  if (!m) return undefined
+  const n = Math.floor(Number(m[1]) * (m[2] === "k" ? 1e3 : m[2] === "m" ? 1e6 : 1))
+  return n > 0 ? n : undefined
+}
+
+export const fmtNum = (n: number) => Math.round(n).toLocaleString("en-US")
+
+const EMPTY_TOKENS = (): TokenTotals => ({ input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 })
+
+// Sum the per-step usage of every assistant message created at/after `since`.
+// Each assistant message carries the usage of the step that produced it, so the
+// sum matches the session totals opencode keeps. Messages without usage (aborted
+// or older mock clients) contribute nothing.
+export function tokenTotals(msgs: any[], since = 0): TokenTotals {
+  const t = EMPTY_TOKENS()
+  for (const m of msgs ?? []) {
+    const info = m?.info ?? m
+    if (info?.role !== "assistant") continue
+    const created = info?.time?.created ?? 0
+    if (since && created && created < since) continue
+    const u = info?.tokens
+    if (!u) continue
+    t.input += u.input ?? 0
+    t.output += u.output ?? 0
+    t.reasoning += u.reasoning ?? 0
+    t.cacheRead += u.cache?.read ?? 0
+    t.cacheWrite += u.cache?.write ?? 0
+  }
+  t.total = t.input + t.output + t.reasoning
+  return t
+}
+
 // ---------- engine ----------
 
 export interface EngineDeps {
@@ -145,6 +207,16 @@ export function createEngine(deps: EngineDeps) {
   const cache = new Map<string, LoopState>() // opencode sessionID -> active loop
   const interrupted = new Set<string>()
   const handling = new Set<string>()
+
+  // Token accounting for the current task: parent session usage plus every
+  // Morty child spawned for it, so a ticket's real cost is visible.
+  const tokensUsed = (st: LoopState) => (st.tokensUsed?.total ?? 0) + (st.mortyTokens ?? 0)
+  const budgetText = (st: LoopState) => {
+    const used = tokensUsed(st)
+    if (!st.maxTokens) return `${fmtNum(used)} used (no cap)`
+    const pct = Math.min(100, Math.round((used / st.maxTokens) * 100))
+    return `${fmtNum(used)} / ${fmtNum(st.maxTokens)} (${pct}%)`
+  }
 
   // ----- logging / UI (never throw) -----
   const log = async (level: "debug" | "info" | "warn" | "error", message: string) => {
@@ -208,11 +280,21 @@ export function createEngine(deps: EngineDeps) {
   }
 
   // ----- prompts -----
+  function budgetLine(st: LoopState): string {
+    const used = tokensUsed(st)
+    if (!st.maxTokens) {
+      return `• Tokens used by this task so far: ${fmtNum(used)}. Spend them like Rick's last battery: no redundant file reads, no full log dumps, targeted commands only.`
+    }
+    const left = Math.max(0, st.maxTokens - used)
+    return `• Token budget: ${fmtNum(used)} / ${fmtNum(st.maxTokens)} used (${fmtNum(left)} left). Be economical — no redundant reads, no log dumps, targeted test commands. If you get close to the limit, finish the ticket in hand and stop with a short status instead of starting new work.`
+  }
+
   function buildPrompt(st: LoopState): string {
     return [
       `🥒 PICKLE RICK LOOP — iteration ${st.iteration}/${st.maxIterations} · phase: ${st.phase} · session dir: ${relDir(st)}`,
       ``,
       st.task,
+      budgetLine(st),
       ``,
       `── Loop rules (same every iteration) ──`,
       `• Your previous work persists in files and git history. FIRST read ${relDir(st)}/ (prd.md, tickets/, research/, plans/) and \`git status\`, then continue where you left off.`,
@@ -238,7 +320,8 @@ export function createEngine(deps: EngineDeps) {
     save(st)
     cache.delete(st.sessionID)
     const ok = reason === "completed"
-    await toast(`🥒 ${ok ? "Done" : "Loop stopped"}: ${reason} (iteration ${st.iteration}/${st.maxIterations})`, ok ? "success" : "warning")
+    const tok = tokensUsed(st)
+    await toast(`🥒 ${ok ? "Done" : "Loop stopped"}: ${reason} (iteration ${st.iteration}/${st.maxIterations}${tok ? ` · ${fmtNum(tok)} tokens` : ""})`, ok ? "success" : "warning")
     await log("info", `loop ${st.id} finished: ${reason}`)
     if (ok && st.jar) await nextFromJar(st.sessionID)
   }
@@ -265,6 +348,12 @@ export function createEngine(deps: EngineDeps) {
       const msgs: any[] = unwrap(await client.session.messages({ path: { id: sessionID } })) ?? []
       const lastAssistant = [...msgs].reverse().find((m) => m.info?.role === "assistant")
       if (!lastAssistant) return
+      // Refresh usage on every finished turn, before any early return.
+      const usage = tokenTotals(msgs, st.startedAt)
+      const prevTotal = st.tokensUsed?.total ?? 0
+      st.tokensUsed = usage
+      st.lastTurnTokens = Math.max(0, usage.total - prevTotal)
+      save(st)
       if (lastAssistant.info.id === st.lastHandledMessageID) return // duplicate idle
       if (!lastAssistant.info.time?.completed && !lastAssistant.info.error) return // still streaming
       st.lastHandledMessageID = lastAssistant.info.id
@@ -274,6 +363,7 @@ export function createEngine(deps: EngineDeps) {
       }
       const text = (lastAssistant.parts ?? []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n")
       if (extractPromise(text) === st.completionPromise) return await finish(st, "completed")
+      if (st.maxTokens > 0 && tokensUsed(st) >= st.maxTokens) return await finish(st, "max-tokens")
       if (st.iteration >= st.maxIterations) return await finish(st, "max-iterations")
       if (now() - st.startedAt > st.maxTimeMs) return await finish(st, "max-time")
       st.iteration++
@@ -321,11 +411,12 @@ export function createEngine(deps: EngineDeps) {
       st.lastHandledMessageID = undefined
       st.stopReason = undefined
     } else {
-      if (!a.task) return `🥒 Usage: /pickle "<task>" [--max-iterations N] [--max-time MIN] [--worker-timeout SEC] [--name SLUG] [--completion-promise TEXT] [--resume [PATH]]`
+      if (!a.task) return `🥒 Usage: /pickle "<task>" [--max-iterations N] [--max-time MIN] [--max-tokens N|off] [--worker-timeout SEC] [--name SLUG] [--completion-promise TEXT] [--resume [PATH]]`
       const name = a.name ?? a.task
       st = {
         id: newId(name), name: slugify(name), task: a.task, active: true, sessionID, iteration: 1,
         maxIterations: DEFAULTS.maxIterations, maxTimeMs: DEFAULTS.maxTimeMin * 60_000,
+        maxTokens: DEFAULTS.maxTokens,
         workerTimeoutMs: DEFAULTS.workerTimeoutSec * 1000, completionPromise: DEFAULTS.promise,
         phase: "prd", startedAt: now(), updatedAt: now(),
       }
@@ -337,13 +428,15 @@ export function createEngine(deps: EngineDeps) {
     st.sessionID = sessionID
     if (a.maxIterations) st.maxIterations = Math.min(a.maxIterations, HARD_CAP_ITERATIONS)
     if (a.maxTimeMin) st.maxTimeMs = a.maxTimeMin * 60_000
+    if (a.maxTokens !== undefined) st.maxTokens = a.maxTokens
     if (a.workerTimeoutSec) st.workerTimeoutMs = a.workerTimeoutSec * 1000
     if (a.completionPromise) st.completionPromise = a.completionPromise
     st.phase = inferPhase(st)
     save(st)
     cache.set(sessionID, st)
+    const limit = st.maxTokens ? `${fmtNum(st.maxTokens)} tokens` : "no token cap"
     return [
-      `🥒 Loop armed (${st.id}). Max ${st.maxIterations} iterations / ${Math.round(st.maxTimeMs / 60000)} min. Completion promise: ${st.completionPromise}`,
+      `🥒 Loop armed (${st.id}). Max ${st.maxIterations} iterations / ${Math.round(st.maxTimeMs / 60000)} min / ${limit}. Completion promise: ${st.completionPromise}`,
       `Session dir: ${relDir(st)}. Starting phase: ${st.phase}.`,
       `Begin NOW, in this turn. Load the \`load-pickle-persona\` skill first, then follow the prompt below.`,
       ``,
@@ -364,6 +457,7 @@ export function createEngine(deps: EngineDeps) {
     const st: LoopState = {
       id: newId(a.name ?? task), name: slugify(a.name ?? task), task, active: false, sessionID: "", iteration: 0,
       maxIterations: DEFAULTS.maxIterations, maxTimeMs: DEFAULTS.maxTimeMin * 60_000,
+      maxTokens: DEFAULTS.maxTokens,
       workerTimeoutMs: DEFAULTS.workerTimeoutSec * 1000, completionPromise: DEFAULTS.promise,
       phase: "prd", startedAt: now(), updatedAt: now(),
     }
@@ -388,6 +482,7 @@ export function createEngine(deps: EngineDeps) {
       `Session: ${st.id} (${st.active ? "ACTIVE" : `stopped: ${st.stopReason ?? "not started"}`})`,
       `Dir: ${relDir(st)}`,
       `Phase: ${st.phase} · iteration ${st.iteration}/${st.maxIterations} · ${mins}/${Math.round(st.maxTimeMs / 60000)} min`,
+      `Tokens: ${budgetText(st)}${st.lastTurnTokens ? ` · last turn +${fmtNum(st.lastTurnTokens)}` : ""}${st.mortyTokens ? ` · Morty ${fmtNum(st.mortyTokens)}` : ""}`,
       `Promise: ${st.completionPromise}`,
       `Task: ${st.task}`,
     ].join("\n")
@@ -396,7 +491,7 @@ export function createEngine(deps: EngineDeps) {
   function compactionContext(sessionID: string): string | undefined {
     const st = findActive(sessionID)
     if (!st) return undefined
-    return `## Pickle Rick loop (must survive compaction)\nTask: ${st.task}\nSession dir: ${relDir(st)} (prd.md, tickets/, research/, plans/)\nPhase: ${st.phase}, iteration ${st.iteration}/${st.maxIterations}\nEnd with <promise>${st.completionPromise}</promise> only when truly complete and verified.`
+    return `## Pickle Rick loop (must survive compaction)\nTask: ${st.task}\nSession dir: ${relDir(st)} (prd.md, tickets/, research/, plans/)\nPhase: ${st.phase}, iteration ${st.iteration}/${st.maxIterations}\nTokens: ${budgetText(st)}\nEnd with <promise>${st.completionPromise}</promise> only when truly complete and verified.`
   }
 
   // ----- the Jar -----
@@ -422,6 +517,7 @@ export function createEngine(deps: EngineDeps) {
     const st: LoopState = {
       id: newId(item.task), name: slugify(item.task), task: item.task, active: true, sessionID, iteration: 1,
       maxIterations: DEFAULTS.maxIterations, maxTimeMs: DEFAULTS.maxTimeMin * 60_000,
+      maxTokens: DEFAULTS.maxTokens,
       workerTimeoutMs: DEFAULTS.workerTimeoutSec * 1000, completionPromise: DEFAULTS.promise,
       phase: "prd", startedAt: now(), updatedAt: now(), jar: true,
     }
@@ -446,9 +542,33 @@ export function createEngine(deps: EngineDeps) {
   // ----- Morty workers -----
   async function sendToMorty(parentID: string, ticket: string, instructions: string): Promise<string> {
     const st = findActive(parentID)
+    if (st && st.maxTokens > 0 && tokensUsed(st) >= st.maxTokens) {
+      return `🥒 Token budget exhausted (${budgetText(st)}). Not spawning Morty for ${ticket}: finish it yourself, or raise the cap with /pickle --resume --max-tokens 4m.`
+    }
     const timeoutMs = st?.workerTimeoutMs ?? DEFAULTS.workerTimeoutSec * 1000
-    const child = unwrap(await client.session.create({ body: { parentID, title: `🥒 Morty: ${ticket}` } }))
+    // Morty runs in a child session with its own context. Inherit the parent's
+    // model (and variant) so the worker does not fall back to the default model;
+    // the agent stays "morty" so the worker prompt/persona is the Morty one.
+    let parentModel: any
+    try {
+      const pmsgs: any[] = unwrap(await client.session.messages({ path: { id: parentID } })) ?? []
+      parentModel = [...pmsgs].reverse().find((m) => m.info?.role === "assistant" && m.info?.model)?.info?.model
+    } catch {}
+    const child = unwrap(
+      await client.session.create({ body: { parentID, title: `🥒 Morty: ${ticket}`, agent: "morty", model: parentModel } }),
+    )
     if (!child?.id) return `Morty failed to spawn for ${ticket}.`
+    const childUsage = async (id: string): Promise<TokenTotals | undefined> => {
+      try { return tokenTotals(unwrap(await client.session.messages({ path: { id } })) ?? []) } catch { return undefined }
+    }
+    const account = async (id: string) => {
+      const usage = await childUsage(id)
+      if (st && usage?.total) {
+        st.mortyTokens = (st.mortyTokens ?? 0) + usage.total
+        save(st)
+      }
+      return usage
+    }
     const where = st ? relDir(st) : ".pickle-rick/sessions/<session>"
     const text = [
       `You are Morty, a worker. Implement exactly ONE ticket: ${ticket}`,
@@ -462,13 +582,15 @@ export function createEngine(deps: EngineDeps) {
     const timeout = new Promise<"timeout">((res) => { timer = setTimeout(() => res("timeout"), timeoutMs) })
     try {
       const r: any = await Promise.race([client.session.prompt({ path: { id: child.id }, body: { agent: "morty", parts: [{ type: "text", text }] } }), timeout])
+      const usage = await account(child.id)
       if (r === "timeout") {
         try { await client.session.abort({ path: { id: child.id } }) } catch {}
-        return `Morty timed out on ${ticket} after ${Math.round(timeoutMs / 1000)}s and was aborted (child session ${child.id}). Check the files, then retry or finish it yourself.`
+        return `Morty timed out on ${ticket} after ${Math.round(timeoutMs / 1000)}s and was aborted (child session ${child.id}, ${usage?.total ? `${fmtNum(usage.total)} tokens` : "usage unknown"}). Check the files, then retry or finish it yourself.`
       }
       const data = unwrap(r)
       const out = (data?.parts ?? []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n").trim()
-      return `Morty finished ${ticket} (child session ${child.id}):\n${out || "(no report)"}`
+      const cost = usage?.total ? `\n(child used ${fmtNum(usage.total)} tokens · ${fmtNum(usage.cacheRead)} cache read)` : ""
+      return `Morty finished ${ticket} (child session ${child.id}):\n${out || "(no report)"}${cost}`
     } catch (e: any) {
       return `Morty crashed on ${ticket}: ${e?.message ?? e}`
     } finally {

@@ -23,7 +23,7 @@ Instalação manual: copie o conteúdo de `.opencode/` para `.opencode/` do proj
 
 | Comando | O que faz |
 |---|---|
-| `/pickle "tarefa" [--max-iterations N] [--max-time MIN] [--worker-timeout SEG] [--name SLUG] [--completion-promise TEXTO] [--resume [PATH]]` | Inicia o loop (padrão: 5 iterações, 60 min, 20 min por Morty, promise `DONE`) |
+| `/pickle "tarefa" [--max-iterations N] [--max-time MIN] [--max-tokens N\|off] [--worker-timeout SEG] [--name SLUG] [--completion-promise TEXTO] [--resume [PATH]]` | Inicia o loop (padrão: 5 iterações, 60 min, 2M tokens, 20 min por Morty, promise `DONE`) |
 | `/pickle-prd "ideia"` | Redige o PRD interativamente; depois `/pickle --resume` |
 | `/eat-pickle` | Cancela o loop |
 | `/add-to-pickle-jar "tarefa"` | Põe uma tarefa na fila (o "Jar") |
@@ -31,6 +31,22 @@ Instalação manual: copie o conteúdo de `.opencode/` para `.opencode/` do proj
 | `/help-pickle` | Cola de comandos |
 
 Esc interrompe: o loop **para** em vez de re-promptar.
+
+## Orçamento de tokens
+
+Cada loop conta tokens por tarefa — `input + output + reasoning`, com cache read/write à parte — e soma o que os Mortys gastam nas sessões-filhas.
+
+```sh
+/pickle "refatorar auth" --max-tokens 500k   # 500_000 tokens
+/pickle "refatorar auth" --max-tokens 1.5m   # 1_500_000
+/pickle "refatorar auth" --max-tokens off    # sem limite
+```
+
+- Teto padrão: **2.000.000 de tokens** por loop.
+- Ao atingir o teto, o loop para com `stopReason: "max-tokens"` em vez de iniciar outra iteração.
+- `pickle_status` mostra `Tokens: usado / teto (porcentagem)`, o último turno e o total dos Mortys; o toast `🥒 Done` também traz a contagem.
+- Todo prompt do loop inclui o orçamento restante, então o modelo sabe quanto falta e é instruído a evitar leituras redundantes e despejo de logs.
+- O teto vale para o loop inteiro, incluindo os Mortys: `pickle_send_to_morty` se recusa a spawnar quando o orçamento acabou.
 
 ## Como o Gemini virou opencode
 
@@ -41,13 +57,14 @@ Esc interrompe: o loop **para** em vez de re-promptar.
 | `skills/*` (`activate_skill`) | `.opencode/skills/*/SKILL.md` (tool nativa `skill`) |
 | `GEMINI.md` (persona) | skill `load-pickle-persona` + regras reinjetadas em todo prompt do loop |
 | Scripts `get_session.sh` / `update-state.js` | tools `pickle_status` / `pickle_set_phase` |
-| `/send-to-morty` (processo gemini separado) | tool `pickle_send_to_morty`: sessão-filha com o agente `morty`, timeout e abort |
+| `/send-to-morty` (processo gemini separado) | tool `pickle_send_to_morty`: sessão-filha com o agente `morty`, o modelo do pai, timeout e abort, e o uso de tokens da filha no relatório |
 | `sessions/` em `~/.gemini/extensions/…` + `includeDirectories` | `.pickle-rick/` no projeto (sem configuração extra) |
 
 Detalhes que fiz de propósito:
 - **Evento de fim de turno traduzido**: no v2.1.x o opencode **não emite mais `session.idle`**; ele emite `session.execution.succeeded` / `.failed` / `.interrupted`. O shim traduz esses três (mais `session.error` e `session.deleted`) para o formato que o motor já entende. O payload vem em `.data`, não em `.properties`.
 - **Dedupe**: o loop só avança quando aparece uma mensagem de assistente *nova e concluída* (`time.completed`), então eventos repetidos não disparam iterações extras.
-- **Preserva agente e modelo**: no v2 a sessão retém o agente/modelo entre prompts; o re-prompt mantém exatamente o que você estava usando.
+- **Preserva agente e modelo**: no v2 a sessão retém o agente/modelo entre prompts; o re-prompt mantém exatamente o que você estava usando. As sessões do Morty são criadas com o modelo do pai e o agente `morty`.
+- **Contabilidade de tokens**: o uso é lido de cada mensagem de assistente (`tokens`) e somado desde o início do loop; o orçamento é checado antes do próximo re-prompt.
 - **`<promise>` só vale na última mensagem** e precisa bater com o texto configurado.
 - **Compactação**: o estado do loop é injetado no resumo via `ctx.session.hook("compaction", …)`.
 
@@ -75,8 +92,10 @@ A última regra que casa vence. No v1 os nomes eram `permission`, `bash` e `task
 
 ## Testes e limites do que foi verificado
 
-- `node --experimental-strip-types --test test/core.test.ts` — 14 testes do motor (parse de args, loop até a promise, max-iterations/max-time, idle duplicado, interrupção, Jar, Morty com timeout) contra um cliente **simulado**.
+- `node --experimental-strip-types --test test/core.test.ts` — 17 testes do motor (parse de args, parse de `--max-tokens`, totais de tokens, parada por `max-tokens`, loop até a promise, max-iterations/max-time, idle duplicado, interrupção, Jar, Morty com timeout, herança de modelo e uso) contra um cliente **simulado**.
 - **Testado dentro do opencode real** (v2.1.3): loop fim-a-fim via servidor persistente com `opencode/deepseek-v4.1-flash-free` → o evento de fim de turno disparou, o motor re-promptou e gravou `stopReason:"completed"` com o toast `🥒 Done`. Interrupção grava `stopReason:"failed: aborted"`.
+- Orçamento de tokens (v2.1.3, ao vivo): `--max-tokens 1` parou o loop com `stopReason:"max-tokens"` depois de 4.884 tokens, e o `pickle_status` reportou o mesmo número.
+- Herança do Morty (v2.1.3, ao vivo): a sessão-filha ficou com `agent: "morty"` e o modelo do pai (`opencode/glm-5.3-flash-free`); o relatório terminou com `(child used 38.179 tokens · 126.080 cache read)`.
 - Ferramentas registradas e executando no host: `pickle_start`, `pickle_stop`, `pickle_status`, `pickle_set_phase`, `pickle_init_prd`, `pickle_jar_add`, `pickle_jar_open`, `pickle_send_to_morty`.
 - Compatível com qualquer modelo do opencode; o teste usou um modelo free só para não gastar créditos.
 - Os textos das skills são originais, no mesmo espírito das do repo; as do repo original também podem ser copiadas para `.opencode/skills/` (mesmo formato `SKILL.md`), trocando `run_shell_command`/`activate_skill` e os scripts do Gemini pelas tools acima.

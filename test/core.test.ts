@@ -3,19 +3,21 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { createEngine, parseArgs, tokenize, extractPromise } from "../.opencode/pickle-rick/core.ts"
+import { createEngine, parseArgs, parseTokenLimit, tokenTotals, tokenize, extractPromise } from "../.opencode/pickle-rick/core.ts"
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "S1"
 
 // A tiny fake of the opencode SDK client: each session.prompt() appends a user message,
 // plays the next scripted assistant reply, and fires session.idle like opencode would.
-function setup(script: string[], opts: { now?: () => number; hangChild?: boolean } = {}) {
+function setup(script: string[], opts: { now?: () => number; hangChild?: boolean; turn?: any } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pickle-"))
   const msgs: any[] = []
+  const childMsgs: any[] = []
   const prompts: any[] = []
   const toasts: string[] = []
   const aborted: string[] = []
+  const created: any[] = []
   let n = 0
   let engine: ReturnType<typeof createEngine>
 
@@ -23,7 +25,7 @@ function setup(script: string[], opts: { now?: () => number; hangChild?: boolean
     const next = script[n] ?? "still working"
     n++
     msgs.push({
-      info: { id: `a${n}`, role: "assistant", time: { created: 1, completed: 2 }, ...assistantOverride },
+      info: { id: `a${n}`, role: "assistant", time: { created: 1, completed: 2 }, ...(opts.turn ?? {}), ...assistantOverride },
       parts: [{ type: "text", text: next }],
     })
     setImmediate(() => engine.handleEvent({ type: "session.idle", properties: { sessionID: SID } }))
@@ -33,11 +35,20 @@ function setup(script: string[], opts: { now?: () => number; hangChild?: boolean
     app: { log: async () => true },
     tui: { showToast: async ({ body }: any) => { toasts.push(body.message); return true } },
     session: {
-      messages: async () => ({ data: msgs }),
+      messages: async ({ path: p }: any) => ({ data: p.id === SID ? msgs : childMsgs }),
       prompt: async ({ path: p, body }: any) => {
         if (p.id !== SID) {
           // Morty child session
           if (opts.hangChild) return new Promise(() => {})
+          childMsgs.push({
+            info: {
+              id: "c1",
+              role: "assistant",
+              time: { created: 1, completed: 2 },
+              tokens: { input: 100, output: 20, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+            parts: [{ type: "text", text: "Ticket done. 3 tests pass." }],
+          })
           return { data: { parts: [{ type: "text", text: "Ticket done. 3 tests pass." }] } }
         }
         prompts.push(body)
@@ -45,7 +56,7 @@ function setup(script: string[], opts: { now?: () => number; hangChild?: boolean
         playTurn()
         return { data: {} }
       },
-      create: async ({ body }: any) => ({ data: { id: "child-1", ...body } }),
+      create: async ({ body }: any) => { created.push(body); return { data: { id: "child-1", ...body } } },
       abort: async ({ path: p }: any) => { aborted.push(p.id); return { data: true } },
     },
   }
@@ -58,7 +69,7 @@ function setup(script: string[], opts: { now?: () => number; hangChild?: boolean
     return out
   }
   const idle = () => engine.handleEvent({ type: "session.idle", properties: { sessionID: SID } })
-  return { dir, engine, prompts, toasts, aborted, msgs, start, idle, playTurn }
+  return { dir, engine, prompts, toasts, aborted, created, msgs, start, idle, playTurn }
 }
 
 const states = (dir: string) =>
@@ -82,6 +93,45 @@ test("parseArgs reads flags, task and resume", () => {
 test("extractPromise takes the last tag", () => {
   assert.equal(extractPromise("a <promise>X</promise> b <promise> DONE </promise>"), "DONE")
   assert.equal(extractPromise("nothing"), null)
+})
+
+test("parseTokenLimit reads k/m suffixes and off", () => {
+  assert.equal(parseTokenLimit("500k"), 500_000)
+  assert.equal(parseTokenLimit("1.5m"), 1_500_000)
+  assert.equal(parseTokenLimit("200000"), 200_000)
+  assert.equal(parseTokenLimit("off"), 0)
+  assert.equal(parseTokenLimit("0"), 0)
+  assert.equal(parseTokenLimit("nope"), undefined)
+  assert.equal(parseArgs(`"x" --max-tokens 500k`).maxTokens, 500_000)
+  assert.equal(parseArgs(`"x" --max-tokens=off`).maxTokens, 0)
+  assert.equal(parseArgs(`"x" --max-tokens nope`).errors.length, 1)
+})
+
+test("tokenTotals sums assistant usage since the loop started", () => {
+  const msgs = [
+    { info: { role: "assistant", time: { created: 100 }, tokens: { input: 10, output: 5, reasoning: 1, cache: { read: 7, write: 2 } } } },
+    { info: { role: "user", time: { created: 150 } } },
+    { info: { role: "assistant", time: { created: 200 }, tokens: { input: 20, output: 8, reasoning: 0, cache: { read: 0, write: 0 } } } },
+  ]
+  assert.deepEqual(tokenTotals(msgs), {
+    input: 30, output: 13, reasoning: 1, cacheRead: 7, cacheWrite: 2, total: 44,
+  })
+  assert.equal(tokenTotals(msgs, 150).total, 28) // only the second turn
+})
+
+test("max-tokens stops the loop before the next iteration", async () => {
+  const t = setup([], {
+    turn: {
+      time: { created: 9e15, completed: 9e15 },
+      tokens: { input: 900, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  })
+  await t.start(`"x" --max-iterations 10 --max-tokens 1k`)
+  await sleep(60)
+  const [st] = states(t.dir)
+  assert.equal(st.stopReason, "max-tokens")
+  assert.equal(st.tokensUsed.total, 1100)
+  assert.equal(t.prompts.length, 0) // the over-budget turn was never re-prompted
 })
 
 test("loop keeps re-prompting until the completion promise", async () => {
@@ -173,11 +223,19 @@ test("jar runs queued tasks back to back", async () => {
   assert.ok(t.toasts.some((m) => m.includes("Jar is empty")))
 })
 
-test("Morty returns the worker report", async () => {
+test("Morty returns the worker report and inherits the parent model", async () => {
   const t = setup([])
   t.engine.startFromRaw(SID, `"x"`)
+  t.msgs.push({
+    info: { id: "am", role: "assistant", model: { providerID: "p", id: "m", variant: "high" }, time: { created: 1, completed: 2 } },
+    parts: [],
+  })
   const out = await t.engine.sendToMorty(SID, "001-thing", "run npm test")
   assert.match(out, /Ticket done/)
+  assert.equal(t.created[0].agent, "morty")
+  assert.deepEqual(t.created[0].model, { providerID: "p", id: "m", variant: "high" })
+  assert.match(out, /child used 120 tokens/)
+  assert.equal(states(t.dir)[0].mortyTokens, 120)
 })
 
 test("Morty is aborted on timeout", async () => {
