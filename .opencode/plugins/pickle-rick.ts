@@ -35,13 +35,18 @@ const textOfParts = (parts: any[]) => (parts ?? []).filter((p: any) => p?.type =
 function makeV1Client(ctx: any) {
   // Poll the session until a NEW assistant message completes (or errors).
   // Resolves soft (empty) on the poll cap so it never fails a slow turn.
+  // A v2 turn can end with `finish: "tool-calls"`, which is NOT the end of the
+  // reply: the model is invoked again after the tools run. Only a terminal turn
+  // (any finish other than "tool-calls") is a real reply.
+  const terminalTurn = (m: any) =>
+    !!m?.error || (m?.finish ? m.finish !== "tool-calls" : (m?.content ?? []).some((c: any) => c?.type === "text" && String(c?.text ?? "").trim()))
   const pollReply = async (sessionID: string, beforeID: string | undefined): Promise<any | undefined> => {
     const deadline = Date.now() + POLL_CAP_MS
     while (Date.now() < deadline) {
       let msgs: any[] = []
       try { msgs = (await ctx.session.context({ sessionID })) ?? [] } catch {}
       const last = [...msgs].reverse().find((m) => m?.type === "assistant")
-      if (last && last.id !== beforeID && (last.time?.completed || last.error)) return last
+      if (last && last.id !== beforeID && (last.time?.completed || last.error) && terminalTurn(last)) return last
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
     }
     return undefined
