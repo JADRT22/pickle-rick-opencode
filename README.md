@@ -1,61 +1,63 @@
-# Pickle Rick para opencode 🥒
+# Pickle Rick for opencode 🥒
 
-Port do [pickle-rick-extension](https://github.com/galdawave/pickle-rick-extension) (Gemini CLI) para o **opencode**: o loop autônomo do Ralph Wiggum + o ciclo PRD → tickets → pesquisa → plano → implementação → refactor, com o Rick no comando e os Mortys como workers.
+**English** · [Português (Brasil)](README.pt-BR.md)
 
-Funciona com **qualquer modelo/provedor** configurado no opencode — o loop re-prompt a própria sessão, então herda o agente e o modelo que você já está usando (não há modelo embutido nem dependência do Gemini).
+Port of [pickle-rick-extension](https://github.com/galdawave/pickle-rick-extension) (Gemini CLI) to **opencode**: Ralph Wiggum's autonomous loop plus the PRD → tickets → research → plan → implementation → refactor lifecycle, with Rick in charge and Mortys as workers.
 
-> Escrito para a **API v2 de plugins** do opencode (`Plugin.define` + `setup(ctx)`, pacote `@opencode/plugin`), testado no **opencode v2.1.3**. O motor (`core.ts`) é puro e independente da API; só o shim fala com o host.
+Works with **any model/provider** configured in opencode — the loop re-prompts the same session, so it inherits the agent and model you are already using (no built-in model, no Gemini dependency).
 
-## Instalação
+> Written against the opencode **v2 plugin API** (`Plugin.define` + `setup(ctx)`, `@opencode/plugin` package), tested on **opencode v2.1.3**. The engine (`core.ts`) is pure and API-agnostic; only the shim talks to the host.
+
+## Installation
 
 ```sh
-./install.sh /caminho/do/projeto   # só nesse projeto
-./install.sh --global              # em ~/.config/opencode
+./install.sh /path/to/project   # this project only
+./install.sh --global           # into ~/.config/opencode
 ```
 
-Reinicie o opencode e rode `/help-pickle`. Cada estado/artefato fica em `.pickle-rick/sessions/<sessão>/` dentro do projeto (o instalador adiciona `.pickle-rick/` ao `.gitignore`; no modo `--global` esse passo não se aplica).
+Restart opencode and run `/help-pickle`. State and artifacts live in `.pickle-rick/sessions/<session>/` inside the project (the installer adds `.pickle-rick/` to `.gitignore`; that step does not apply to `--global`).
 
-Instalação manual: copie o conteúdo de `.opencode/` para `.opencode/` do projeto (ou `~/.config/opencode/`), mantendo a estrutura (`plugins/`, `pickle-rick/`, `commands/`, `agents/`, `skills/`).
+Manual install: copy the contents of `.opencode/` into the project's `.opencode/` (or `~/.config/opencode/`), keeping the structure (`plugins/`, `pickle-rick/`, `commands/`, `agents/`, `skills/`).
 
-## Uso
+## Usage
 
-| Comando | O que faz |
+| Command | What it does |
 |---|---|
-| `/pickle "tarefa" [--max-iterations N] [--max-time MIN] [--worker-timeout SEG] [--name SLUG] [--completion-promise TEXTO] [--resume [PATH]]` | Inicia o loop (padrão: 5 iterações, 60 min, 20 min por Morty, promise `DONE`) |
-| `/pickle-prd "ideia"` | Redige o PRD interativamente; depois `/pickle --resume` |
-| `/eat-pickle` | Cancela o loop |
-| `/add-to-pickle-jar "tarefa"` | Põe uma tarefa na fila (o "Jar") |
-| `/pickle-jar-open` | Roda a fila, um loop após o outro |
-| `/help-pickle` | Cola de comandos |
+| `/pickle "task" [--max-iterations N] [--max-time MIN] [--worker-timeout SEC] [--name SLUG] [--completion-promise TEXT] [--resume [PATH]]` | Starts the loop (defaults: 5 iterations, 60 min, 20 min per Morty, promise `DONE`) |
+| `/pickle-prd "idea"` | Drafts the PRD interactively; then `/pickle --resume` |
+| `/eat-pickle` | Cancels the loop |
+| `/add-to-pickle-jar "task"` | Queues a task in the "Jar" |
+| `/pickle-jar-open` | Runs the queue, one loop after another |
+| `/help-pickle` | Command cheat sheet |
 
-Esc interrompe: o loop **para** em vez de re-promptar.
+Esc interrupts: the loop **stops** instead of re-prompting.
 
-## Como o Gemini virou opencode
+## How Gemini became opencode
 
-| Gemini CLI (original) | opencode (este port) |
+| Gemini CLI (original) | opencode (this port) |
 |---|---|
-| Hook `AfterAgent` que bloqueia a saída | Plugin v2 escutando o fim do turno (`session.execution.succeeded`) e chamando `ctx.session.prompt()` |
-| `commands/*.toml` | `.opencode/commands/*.md` (o `$ARGUMENTS` vai cru para a tool `pickle_start`, que faz o parse dos flags em código) |
-| `skills/*` (`activate_skill`) | `.opencode/skills/*/SKILL.md` (tool nativa `skill`) |
-| `GEMINI.md` (persona) | skill `load-pickle-persona` + regras reinjetadas em todo prompt do loop |
-| Scripts `get_session.sh` / `update-state.js` | tools `pickle_status` / `pickle_set_phase` |
-| `/send-to-morty` (processo gemini separado) | tool `pickle_send_to_morty`: sessão-filha com o agente `morty`, timeout e abort |
-| `sessions/` em `~/.gemini/extensions/…` + `includeDirectories` | `.pickle-rick/` no projeto (sem configuração extra) |
+| `AfterAgent` hook that blocks the exit | v2 plugin listening for turn completion (`session.execution.succeeded`) and calling `ctx.session.prompt()` |
+| `commands/*.toml` | `.opencode/commands/*.md` (`$ARGUMENTS` goes raw to the `pickle_start` tool, which parses the flags in code) |
+| `skills/*` (`activate_skill`) | `.opencode/skills/*/SKILL.md` (native `skill` tool) |
+| `GEMINI.md` (persona) | `load-pickle-persona` skill + rules re-injected on every loop prompt |
+| `get_session.sh` / `update-state.js` scripts | `pickle_status` / `pickle_set_phase` tools |
+| `/send-to-morty` (separate gemini process) | `pickle_send_to_morty` tool: child session with the `morty` agent, timeout and abort |
+| `sessions/` in `~/.gemini/extensions/…` + `includeDirectories` | `.pickle-rick/` in the project (no extra configuration) |
 
-Detalhes que fiz de propósito:
-- **Evento de fim de turno traduzido**: no v2.1.x o opencode **não emite mais `session.idle`**; ele emite `session.execution.succeeded` / `.failed` / `.interrupted`. O shim traduz esses três (mais `session.error` e `session.deleted`) para o formato que o motor já entende. O payload vem em `.data`, não em `.properties`.
-- **Dedupe**: o loop só avança quando aparece uma mensagem de assistente *nova e concluída* (`time.completed`), então eventos repetidos não disparam iterações extras.
-- **Preserva agente e modelo**: no v2 a sessão retém o agente/modelo entre prompts; o re-prompt mantém exatamente o que você estava usando.
-- **`<promise>` só vale na última mensagem** e precisa bater com o texto configurado.
-- **Compactação**: o estado do loop é injetado no resumo via `ctx.session.hook("compaction", …)`.
+Deliberate details:
+- **Turn-end event translated**: on v2.1.x opencode **no longer emits `session.idle`**; it emits `session.execution.succeeded` / `.failed` / `.interrupted`. The shim translates those three (plus `session.error` and `session.deleted`) into the shape the engine already understands. The payload rides in `.data`, not `.properties`.
+- **Dedupe**: the loop only advances when a *new and completed* assistant message appears (`time.completed`), so repeated events do not trigger extra iterations.
+- **Preserves agent and model**: in v2 the session retains the agent/model across prompts; the re-prompt keeps exactly what you were using.
+- **`<promise>` only counts on the last message** and must match the configured text.
+- **Compaction**: the loop state is injected into the summary via `ctx.session.hook("compaction", …)`.
 
-## Por que precisa de sessão persistente
+## Why it needs a persistent session
 
-O loop só avança quando o turno termina e o evento de execução chega ao plugin. Em **sessão interativa (TUI)** isso é o fluxo normal. Em `opencode run` de turno único, o processo pode encerrar antes que o evento seja entregue — use a TUI para o loop autônomo.
+The loop only advances when a turn ends and the execution event reaches the plugin. In an **interactive session (TUI)** that is the normal flow. In a one-shot `opencode run`, the process may exit before the event is delivered — use the TUI for the autonomous loop.
 
-## Segurança (leia)
+## Security (read this)
 
-O loop executa código e shell sozinho. Rode em um branch/worktree ou sandbox e **bloqueie o push**. Exemplo de `opencode.jsonc` na forma **v2** (`permissions` como lista de regras, ação `shell`):
+The loop executes code and shell on its own. Run it in a branch/worktree or sandbox and **block pushes**. Example `opencode.jsonc` in the **v2** shape (`permissions` as a rule list, `shell` action):
 
 ```jsonc
 {
@@ -69,12 +71,12 @@ O loop executa código e shell sozinho. Rode em um branch/worktree ou sandbox e 
 }
 ```
 
-A última regra que casa vence. No v1 os nomes eram `permission`, `bash` e `task`; no v2 são `permissions`, `shell` e `subagent`. Os Mortys rodam em sessões-filhas e também passam por essas regras; se o opencode pedir aprovação, o loop espera você.
+The last matching rule wins. In v1 the names were `permission`, `bash` and `task`; in v2 they are `permissions`, `shell` and `subagent`. Mortys run in child sessions and also go through these rules; if opencode asks for approval, the loop waits for you.
 
-## Testes e limites do que foi verificado
+## Tests and verification limits
 
-- `node --experimental-strip-types --test test/core.test.ts` — 14 testes do motor (parse de args, loop até a promise, max-iterations/max-time, idle duplicado, interrupção, Jar, Morty com timeout) contra um cliente **simulado**.
-- **Testado dentro do opencode real** (v2.1.3): loop fim-a-fim via servidor persistente com `opencode/deepseek-v4.1-flash-free` → o evento de fim de turno disparou, o motor re-promptou e gravou `stopReason:"completed"` com o toast `🥒 Done`. Interrupção grava `stopReason:"failed: aborted"`.
-- Ferramentas registradas e executando no host: `pickle_start`, `pickle_stop`, `pickle_status`, `pickle_set_phase`, `pickle_init_prd`, `pickle_jar_add`, `pickle_jar_open`, `pickle_send_to_morty`.
-- Compatível com qualquer modelo do opencode; o teste usou um modelo free só para não gastar créditos.
-- Os textos das skills são originais, no mesmo espírito das do repo; as do repo original também podem ser copiadas para `.opencode/skills/` (mesmo formato `SKILL.md`), trocando `run_shell_command`/`activate_skill` e os scripts do Gemini pelas tools acima.
+- `node --experimental-strip-types --test test/core.test.ts` — 14 engine tests (arg parsing, loop until the promise, max-iterations/max-time, duplicate idle, interruption, Jar, Morty with timeout) against a **mocked** client.
+- **Tested inside a real opencode** (v2.1.3): end-to-end loop through a persistent server with `opencode/deepseek-v4.1-flash-free` → the turn-end event fired, the engine re-prompted and persisted `stopReason:"completed"` with the `🥒 Done` toast. Interruption persists `stopReason:"failed: aborted"`.
+- Tools registered and executing on the host: `pickle_start`, `pickle_stop`, `pickle_status`, `pickle_set_phase`, `pickle_init_prd`, `pickle_jar_add`, `pickle_jar_open`, `pickle_send_to_morty`.
+- Compatible with any opencode model; the test used a free model only to avoid spending credits.
+- The skill texts are original, in the same spirit as the repo's; the original repo's skills can also be copied into `.opencode/skills/` (same `SKILL.md` format), replacing `run_shell_command`/`activate_skill` and the Gemini scripts with the tools above.
