@@ -245,3 +245,30 @@ test("Morty is aborted on timeout", async () => {
   assert.match(out, /timed out/)
   assert.deepEqual(t.aborted, ["child-1"])
 })
+
+test("status reports remaining budget, Jar queue and artifacts", () => {
+  const t = setup([])
+  t.engine.initPrd("status demo")
+  const st = states(t.dir)[0]
+  fs.writeFileSync(path.join(t.dir, ".pickle-rick/sessions", st.id, "tickets", "001-a.md"), "# a")
+  t.engine.jarAdd("queued")
+  const out = t.engine.status(SID)
+  assert.match(out, /Left: 2,000,000 left/)
+  assert.match(out, /Jar: 1 queued/)
+  assert.match(out, /Artifacts: prd no · tickets 1 · research 0 · plans 0/)
+})
+
+test("resume keeps the recorded phase", () => {
+  const t = setup([])
+  t.engine.initPrd("resume demo")
+  const st = states(t.dir)[0]
+  const dir = path.join(t.dir, ".pickle-rick/sessions", st.id)
+  for (const [f, body] of [["prd.md", "# p"], ["tickets/001-a.md", "# a"], ["research/r.md", "# r"], ["plans/p.md", "# p"]] as const) {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true })
+    fs.writeFileSync(path.join(dir, f), body)
+  }
+  st.phase = "refactor"
+  fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(st, null, 2))
+  t.engine.startFromRaw(SID, "--resume")
+  assert.equal(states(t.dir)[0].phase, "refactor")
+})

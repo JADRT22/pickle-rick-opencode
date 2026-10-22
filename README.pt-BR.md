@@ -13,6 +13,7 @@ Funciona com **qualquer modelo/provedor** configurado no opencode — o loop re-
 ```sh
 ./install.sh /caminho/do/projeto   # só nesse projeto
 ./install.sh --global              # em ~/.config/opencode
+./install.sh --help                # ajuda
 ```
 
 Reinicie o opencode e rode `/help-pickle`. Cada estado/artefato fica em `.pickle-rick/sessions/<sessão>/` dentro do projeto (o instalador adiciona `.pickle-rick/` ao `.gitignore`; no modo `--global` esse passo não se aplica).

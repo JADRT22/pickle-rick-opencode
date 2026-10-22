@@ -268,7 +268,10 @@ export function createEngine(deps: EngineDeps) {
     save(st)
   }
 
-  const nonEmpty = (p: string) => fs.existsSync(p) && fs.readdirSync(p).some((f: string) => !f.startsWith("."))
+  const countFiles = (p: string) => {
+    try { return fs.readdirSync(p).filter((f: string) => !f.startsWith(".")).length } catch { return 0 }
+  }
+  const nonEmpty = (p: string) => countFiles(p) > 0
 
   function inferPhase(st: LoopState): Phase {
     const d = dirOf(st)
@@ -431,7 +434,9 @@ export function createEngine(deps: EngineDeps) {
     if (a.maxTokens !== undefined) st.maxTokens = a.maxTokens
     if (a.workerTimeoutSec) st.workerTimeoutMs = a.workerTimeoutSec * 1000
     if (a.completionPromise) st.completionPromise = a.completionPromise
-    st.phase = inferPhase(st)
+    // Keep the furthest phase: artifacts can move the loop forward, but resuming
+    // a loop that already reached refactor must not drag it back to implement.
+    st.phase = PHASES[Math.max(PHASES.indexOf(st.phase), PHASES.indexOf(inferPhase(st)))]
     save(st)
     cache.set(sessionID, st)
     const limit = st.maxTokens ? `${fmtNum(st.maxTokens)} tokens` : "no token cap"
@@ -483,6 +488,9 @@ export function createEngine(deps: EngineDeps) {
       `Dir: ${relDir(st)}`,
       `Phase: ${st.phase} · iteration ${st.iteration}/${st.maxIterations} · ${mins}/${Math.round(st.maxTimeMs / 60000)} min`,
       `Tokens: ${budgetText(st)}${st.lastTurnTokens ? ` · last turn +${fmtNum(st.lastTurnTokens)}` : ""}${st.mortyTokens ? ` · Morty ${fmtNum(st.mortyTokens)}` : ""}`,
+      `Left: ${st.maxTokens ? `${fmtNum(Math.max(0, st.maxTokens - tokensUsed(st)))} left` : "no cap"}`,
+      `Jar: ${readJar().length} queued`,
+      `Artifacts: prd ${fs.existsSync(path.join(dirOf(st), "prd.md")) ? "yes" : "no"} · tickets ${countFiles(path.join(dirOf(st), "tickets"))} · research ${countFiles(path.join(dirOf(st), "research"))} · plans ${countFiles(path.join(dirOf(st), "plans"))}`,
       `Promise: ${st.completionPromise}`,
       `Task: ${st.task}`,
     ].join("\n")
