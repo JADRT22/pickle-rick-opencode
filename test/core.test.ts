@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { createEngine, parseArgs, parseTokenLimit, tokenTotals, tokenize, extractPromise } from "../.opencode/pickle-rick/core.ts"
+import { createEngine, parseArgs, parseModelRef, parseTokenLimit, tokenTotals, tokenize, extractPromise } from "../.opencode/pickle-rick/core.ts"
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "S1"
@@ -75,6 +75,14 @@ function setup(script: string[], opts: { now?: () => number; hangChild?: boolean
 const states = (dir: string) =>
   fs.readdirSync(path.join(dir, ".pickle-rick/sessions")).map((d) => JSON.parse(fs.readFileSync(path.join(dir, ".pickle-rick/sessions", d, "state.json"), "utf8")))
 
+// Drop a ticket into the newest session so Morty has something to claim.
+const writeTicket = (dir: string, id: string, status = "open") => {
+  const st = states(dir)[0]
+  const p = path.join(dir, ".pickle-rick/sessions", st.id, "tickets", `${id}.md`)
+  fs.mkdirSync(path.dirname(p), { recursive: true })
+  fs.writeFileSync(p, `# ${id}\nStatus: ${status}`)
+}
+
 test("tokenize keeps apostrophes and quoted phrases", () => {
   assert.deepEqual(tokenize(`fix the user's login --name "my slug"`), ["fix", "the", "user's", "login", "--name", "my slug"])
 })
@@ -114,7 +122,7 @@ test("tokenTotals sums assistant usage since the loop started", () => {
     { info: { role: "assistant", time: { created: 200 }, tokens: { input: 20, output: 8, reasoning: 0, cache: { read: 0, write: 0 } } } },
   ]
   assert.deepEqual(tokenTotals(msgs), {
-    input: 30, output: 13, reasoning: 1, cacheRead: 7, cacheWrite: 2, total: 44,
+    input: 30, output: 13, reasoning: 1, cacheRead: 7, cacheWrite: 2, total: 44, cost: 0,
   })
   assert.equal(tokenTotals(msgs, 150).total, 28) // only the second turn
 })
@@ -226,6 +234,7 @@ test("jar runs queued tasks back to back", async () => {
 test("Morty returns the worker report and inherits the parent model", async () => {
   const t = setup([])
   t.engine.startFromRaw(SID, `"x"`)
+  writeTicket(t.dir, "001-thing")
   t.msgs.push({
     info: { id: "am", role: "assistant", model: { providerID: "p", id: "m", variant: "high" }, time: { created: 1, completed: 2 } },
     parts: [],
@@ -241,6 +250,7 @@ test("Morty returns the worker report and inherits the parent model", async () =
 test("Morty is aborted on timeout", async () => {
   const t = setup([], { hangChild: true })
   t.engine.startFromRaw(SID, `"x" --worker-timeout 1`)
+  writeTicket(t.dir, "001-thing")
   const out = await t.engine.sendToMorty(SID, "001-thing", "go")
   assert.match(out, /timed out/)
   assert.deepEqual(t.aborted, ["child-1"])
@@ -272,3 +282,116 @@ test("resume keeps the recorded phase", () => {
   t.engine.startFromRaw(SID, "--resume")
   assert.equal(states(t.dir)[0].phase, "refactor")
 })
+
+test("parseModelRef splits provider/model and keeps variants", () => {
+  assert.deepEqual(parseModelRef("opencode/glm-5.3-flash-free"), { providerID: "opencode", id: "glm-5.3-flash-free" })
+  assert.deepEqual(parseModelRef("p/m#high"), { providerID: "p", id: "m", variant: "high" })
+  assert.equal(parseModelRef("nope"), undefined)
+  const a = parseArgs(`"x" --force --allow-dirty --morty-model opencode/glm-5.3`)
+  assert.equal(a.task, "x")
+  assert.equal(a.force, true)
+  assert.equal(a.allowDirty, true)
+  assert.equal(a.mortyModel?.id, "glm-5.3")
+})
+
+test("a second start is refused until --force", () => {
+  const t = setup([])
+  assert.match(t.engine.startFromRaw(SID, `"x" --max-iterations 50`), /Loop armed/)
+  assert.match(t.engine.startFromRaw(SID, `"y" --max-iterations 50`), /already running/)
+  assert.match(t.engine.startFromRaw(SID, `"y" --max-iterations 50 --force`), /Loop armed/)
+})
+
+test("warns once when the token budget crosses 80%", async () => {
+  const t = setup([], {
+    turn: {
+      time: { created: 9e15, completed: 9e15 },
+      tokens: { input: 1600, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  })
+  await t.start(`"x" --max-iterations 10 --max-tokens 2k`)
+  await t.idle()
+  const warnings = t.toasts.filter((m) => m.includes("tokens used"))
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /85%/)
+})
+
+test("status shows ticket progress, cost and phase burn", async () => {
+  const t = setup([], {
+    turn: {
+      time: { created: 9e15, completed: 9e15 },
+      cost: 0.01,
+      tokens: { input: 1000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  })
+  await t.start(`"x" --max-iterations 10`)
+  const st = states(t.dir)[0]
+  const tickets = path.join(t.dir, ".pickle-rick/sessions", st.id, "tickets")
+  fs.writeFileSync(path.join(tickets, "001-a.md"), "# a\nStatus: done")
+  fs.writeFileSync(path.join(tickets, "002-b.md"), "# b\nStatus: open")
+  const out = t.engine.status(SID)
+  assert.match(out, /Tickets: 1\/2 done · next 002-b/)
+  assert.match(out, /\$0\.\d{4}/)
+  assert.match(out, /Burn: prd/)
+})
+
+test("Morty picks the next open ticket and refuses a done one", async () => {
+  const t = setup([])
+  t.engine.startFromRaw(SID, `"x" --max-iterations 10`)
+  const st = states(t.dir)[0]
+  const tickets = path.join(t.dir, ".pickle-rick/sessions", st.id, "tickets")
+  fs.writeFileSync(path.join(tickets, "001-a.md"), "# a\nStatus: done")
+  fs.writeFileSync(path.join(tickets, "002-b.md"), "# b\nStatus: open")
+  assert.match(await t.engine.sendToMorty(SID, "001-a", "go"), /already done/)
+  assert.equal(t.created.length, 0)
+  assert.match(await t.engine.sendToMorty(SID, "", "go"), /Ticket done/)
+  assert.match(t.created[0].title, /002-b/)
+})
+
+test("--morty-model overrides the inherited parent model", async () => {
+  const t = setup([])
+  t.engine.startFromRaw(SID, `"x" --max-iterations 10 --morty-model opencode/cheap#high`)
+  writeTicket(t.dir, "001-any")
+  await t.engine.sendToMorty(SID, "001-any", "go")
+  assert.deepEqual(t.created[0].model, { providerID: "opencode", id: "cheap", variant: "high" })
+})
+
+test("compaction carries a PRD excerpt", () => {
+  const t = setup([])
+  t.engine.initPrd("compaction demo")
+  const st = states(t.dir)[0]
+  fs.writeFileSync(path.join(t.dir, ".pickle-rick/sessions", st.id, "prd.md"), "# PRD\nUniqueRequirementLine")
+  t.engine.startFromRaw(SID, "--resume")
+  assert.match(t.engine.compactionContext(SID) ?? "", /UniqueRequirementLine/)
+})
+
+test("jar list shows the queue in order", () => {
+  const t = setup([])
+  t.engine.jarAdd("first")
+  t.engine.jarAdd("second")
+  const out = t.engine.jarList()
+  assert.match(out, /1\. first/)
+  assert.match(out, /2\. second/)
+  assert.match(setup([]).engine.jarList(), /Jar is empty/)
+})
+
+test("clean removes only old finished sessions", () => {
+  const t = setup([])
+  t.engine.initPrd("old one")
+  t.engine.initPrd("fresh one")
+  const all = states(t.dir)
+  const old = all.find((s) => s.task === "old one")!
+  old.updatedAt = Date.now() - 10 * 86_400_000
+  fs.writeFileSync(path.join(t.dir, ".pickle-rick/sessions", old.id, "state.json"), JSON.stringify(old, null, 2))
+  assert.match(t.engine.cleanSessions(7), /Removed 1/)
+  assert.equal(states(t.dir).length, 1)
+  assert.ok(!fs.existsSync(path.join(t.dir, ".pickle-rick/sessions", old.id)))
+})
+
+test("status flags a stale active loop", () => {
+  let clock = 0
+  const t = setup([], { now: () => clock })
+  t.engine.startFromRaw(SID, `"x" --max-iterations 50`)
+  clock = 1_200_000
+  assert.match(t.engine.status(SID), /STALE 20m/)
+})
+

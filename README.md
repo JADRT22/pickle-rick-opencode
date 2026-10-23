@@ -13,6 +13,7 @@ Works with **any model/provider** configured in opencode — the loop re-prompts
 ```sh
 ./install.sh /path/to/project   # this project only
 ./install.sh --global           # into ~/.config/opencode
+./install.sh --uninstall [PROJECT]  # remove this package (project or with --global)
 ./install.sh --help             # usage
 ```
 
@@ -24,14 +25,17 @@ Manual install: copy the contents of `.opencode/` into the project's `.opencode/
 
 | Command | What it does |
 |---|---|
-| `/pickle "task" [--max-iterations N] [--max-time MIN] [--max-tokens N\|off] [--worker-timeout SEC] [--name SLUG] [--completion-promise TEXT] [--resume [PATH]]` | Starts the loop (defaults: 5 iterations, 60 min, 2M tokens, 20 min per Morty, promise `DONE`) |
+| `/pickle "task" [--max-iterations N] [--max-time MIN] [--max-tokens N\|off] [--worker-timeout SEC] [--morty-model PROVIDER/MODEL] [--name SLUG] [--completion-promise TEXT] [--allow-dirty] [--force] [--resume [PATH]]` | Starts the loop (defaults: 5 iterations, 60 min, 2M tokens, 20 min per Morty, promise `DONE`) |
 | `/pickle-prd "idea"` | Drafts the PRD interactively; then `/pickle --resume` |
 | `/eat-pickle` | Cancels the loop |
 | `/add-to-pickle-jar "task"` | Queues a task in the "Jar" |
+| `/pickle-jar-list` | Lists the queued tasks |
 | `/pickle-jar-open` | Runs the queue, one loop after another |
 | `/help-pickle` | Command cheat sheet |
 
-Esc interrupts: the loop **stops** instead of re-prompting.
+Esc interrupts: the loop **stops** instead of re-prompting. Starting a second loop while one is active is refused; use `--resume` to continue it or `--force` to replace it. A dirty working tree is refused too unless you pass `--allow-dirty`.
+
+Tickets whose head says `Status: done` are skipped automatically: `pickle_status` shows `Tickets: done/total · next <ticket>`, and `pickle_send_to_morty` with an empty ticket picks the next open one.
 
 ## Token budget
 
@@ -45,9 +49,17 @@ Every loop counts tokens per task — `input + output + reasoning`, with cache r
 
 - Default cap: **2,000,000 tokens** per loop.
 - When the cap is reached, the loop stops with `stopReason: "max-tokens"` instead of starting another iteration.
-- `pickle_status` reports `Tokens: used / cap (percent)`, the last turn and the Morty total; the `🥒 Done` toast also carries the token count.
+- At **80%** the loop warns once (toast + a marker in every prompt) so the model wraps up the ticket in hand.
+- `pickle_status` reports `Tokens: used / cap (percent) · $cost`, the last turn, the Morty total and a `Burn:` line with the phases that spent the most. The `🥒 Done` toast carries tokens and USD.
 - Every loop prompt includes the remaining budget, so the model knows how much it has left and is told to avoid redundant reads and log dumps.
 - The cap covers the whole loop, Morty children included: `pickle_send_to_morty` refuses to spawn when the budget is exhausted.
+- `--morty-model provider/model` runs workers on another (cheaper) model; default is the parent's model.
+
+## Sessions and cleanup
+
+- `pickle_sessions` lists every session with state, phase and token usage.
+- `pickle_clean` (tool, default 7 days) deletes **finished** sessions older than N days; an active loop is never removed.
+- `pickle_status` marks an active loop as `STALE` after 15 minutes without a heartbeat — the process probably died. Start again with `--force` or `--resume`.
 
 ## How Gemini became opencode
 
@@ -91,12 +103,24 @@ The loop executes code and shell on its own. Run it in a branch/worktree or sand
 
 The last matching rule wins. In v1 the names were `permission`, `bash` and `task`; in v2 they are `permissions`, `shell` and `subagent`. Mortys run in child sessions and also go through these rules; if opencode asks for approval, the loop waits for you.
 
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Loop never re-prompts | It needs a persistent session (TUI). One-shot `opencode run` may exit before the event. |
+| `pickle_status` shows `STALE` | The process died mid-loop. `/pickle --resume` continues it, `--force` replaces it. |
+| `A loop is already running` | Use `/pickle --resume` (continue) or add `--force` (replace). |
+| `Working tree is dirty` | Commit/stash first, or start with `--allow-dirty`. |
+| Morty says the ticket is missing | Create files in `tickets/` or pass the id; tickets with `Status: done` are refused. |
+| Tools missing after install | Restart opencode; the host discovers plugins at startup. |
+| Uninstall left other files | It only removes the files this package owns; other plugins/agents stay. |
+
 ## Tests and verification limits
 
-- `node --experimental-strip-types --test test/core.test.ts` — 17 engine tests (arg parsing, `--max-tokens` parsing, token totals, `max-tokens` stop, loop until the promise, max-iterations/max-time, duplicate idle, interruption, Jar, Morty with timeout, model inheritance and usage) against a **mocked** client.
+- `node --experimental-strip-types --test test/core.test.ts test/adapter.test.ts` — **37 tests**: 29 engine (parsing, tokens/cost, budget stop, 80% warning, loop until the promise, max-iterations/max-time, duplicate idle, interruption, tickets, Jar, sessions/clean, stale detection, Morty model override, timeout and usage) and 8 adapter tests (polling, tool-call turns, message mapping, create/model forwarding, interrupt) against **mocks**, no host needed.
 - **Tested inside a real opencode** (v2.1.3): end-to-end loop through a persistent server with `opencode/deepseek-v4.1-flash-free` → the turn-end event fired, the engine re-prompted and persisted `stopReason:"completed"` with the `🥒 Done` toast. Interruption persists `stopReason:"failed: aborted"`.
 - Token budget (v2.1.3, live): `--max-tokens 1` stopped the loop at `stopReason:"max-tokens"` after 4,884 tokens, and `pickle_status` reported the same figure.
 - Morty inheritance (v2.1.3, live): the child session had `agent: "morty"` and the parent's model (`opencode/glm-5.3-flash-free`); the report ended with `(child used 38,179 tokens · 126,080 cache read)`.
-- Tools registered and executing on the host: `pickle_start`, `pickle_stop`, `pickle_status`, `pickle_set_phase`, `pickle_init_prd`, `pickle_jar_add`, `pickle_jar_open`, `pickle_send_to_morty`.
+- Tools registered and executing on the host: `pickle_start`, `pickle_stop`, `pickle_status`, `pickle_set_phase`, `pickle_init_prd`, `pickle_jar_add`, `pickle_jar_list`, `pickle_jar_open`, `pickle_sessions`, `pickle_clean`, `pickle_send_to_morty`.
 - Compatible with any opencode model; the test used a free model only to avoid spending credits.
 - The skill texts are original, in the same spirit as the repo's; the original repo's skills can also be copied into `.opencode/skills/` (same `SKILL.md` format), replacing `run_shell_command`/`activate_skill` and the Gemini scripts with the tools above.

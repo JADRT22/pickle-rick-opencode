@@ -1,140 +1,42 @@
 // 🥒 Pickle Rick for opencode v2 — loop engine, tools and hooks.
-// Ported from the V1 plugin API to the V2 `Plugin.define` shape.
 // The loop logic lives in ../pickle-rick/core.ts (pure, unit-tested) and is
-// unchanged: it is written against the V1 `client` RPC shape, so this file
-// exposes a thin V1-shaped adapter on top of the V2 plugin context.
+// written against the V1 `client` RPC shape; ../pickle-rick/adapter.ts exposes
+// that shape on top of the V2 plugin context.
+import { execSync } from "node:child_process"
 import { Plugin } from "@opencode/plugin"
 import { createEngine, PHASES } from "../pickle-rick/core"
+import { createV1Client } from "../pickle-rick/adapter"
 
-// How long the adapter waits for a turn to finish before resolving empty.
-// Purely a leak-guard for abandoned/interrupted sessions; the real per-ticket
-// timeout is enforced by core (workerTimeoutMs) and the loop caps by
-// max-iterations / max-time on idle events.
-const POLL_CAP_MS = 45 * 60_000
-const POLL_INTERVAL_MS = 1500
-
-// Flatten a v2 message (Session.Message.Info union) into the V1 {info, parts}
-// shape core.ts reads: info.role/id/time/error/agent/model + parts[{type,text}].
-function mapMessage(m: any) {
-  const role = m?.type === "user" ? "user" : m?.type === "assistant" ? "assistant" : m?.type
-  // v2 assistant error is a StructuredError ({type,message}); the aborted error
-  // carries `name`. core.ts reads `.name`, so normalize type -> name.
-  const err = m?.error ? { name: m.error.name ?? m.error.type, ...m.error } : undefined
-  const parts =
-    m?.type === "assistant"
-      ? (m.content ?? []).filter((c: any) => c?.type === "text").map((c: any) => ({ type: "text", text: c.text }))
-      : m?.type === "user"
-        ? [{ type: "text", text: m.text }]
-        : []
-  return {
-    info: {
-      role,
-      id: m?.id,
-      time: m?.time,
-      error: err,
-      agent: m?.agent,
-      model: m?.model,
-      finish: m?.finish,
-      tokens: m?.tokens,
-      cost: m?.cost,
-    },
-    parts,
-  }
-}
-
-const textOfParts = (parts: any[]) => (parts ?? []).filter((p: any) => p?.type === "text").map((p: any) => p.text).join("\n")
-
-// Build the V1-shaped `client` core.ts expects, backed by the v2 ctx.
-function makeV1Client(ctx: any) {
-  // Poll the session until a NEW assistant message completes (or errors).
-  // Resolves soft (empty) on the poll cap so it never fails a slow turn.
-  // A v2 turn can end with `finish: "tool-calls"`, which is NOT the end of the
-  // reply: the model is invoked again after the tools run. Only a terminal turn
-  // (any finish other than "tool-calls") is a real reply.
-  const terminalTurn = (m: any) =>
-    !!m?.error || (m?.finish ? m.finish !== "tool-calls" : (m?.content ?? []).some((c: any) => c?.type === "text" && String(c?.text ?? "").trim()))
-  const pollReply = async (sessionID: string, beforeID: string | undefined): Promise<any | undefined> => {
-    const deadline = Date.now() + POLL_CAP_MS
-    while (Date.now() < deadline) {
-      let msgs: any[] = []
-      try { msgs = (await ctx.session.context({ sessionID })) ?? [] } catch {}
-      const last = [...msgs].reverse().find((m) => m?.type === "assistant")
-      if (last && last.id !== beforeID && (last.time?.completed || last.error) && terminalTurn(last)) return last
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
-    }
-    return undefined
-  }
-
-  return {
-    app: {
-      log: async ({ body }: any) => {
-        try { console.error(`[pickle-rick:${body?.level}] ${body?.message}`) } catch {}
-      },
-    },
-    tui: {
-      showToast: async ({ body }: any) => {
-        try { console.error(`[pickle-rick:toast:${body?.variant}] ${body?.message}`) } catch {}
-      },
-    },
-    session: {
-      // V1: {path:{id}, body:{parts, agent?, model?}} -> resolves with the turn's
-      // assistant message ({data:{info,parts}}). v2 prompt resolves on admission,
-      // so we admit, then poll for the reply.
-      async prompt({ path, body }: any) {
-        const sessionID = path.id
-        const text = textOfParts(body?.parts)
-        // v2 keeps agent/model on the session; only switch when explicitly asked.
-        if (body?.agent) { try { await ctx.session.switchAgent({ sessionID, agent: body.agent }) } catch {} }
-        if (body?.model?.id && body?.model?.providerID) { try { await ctx.session.switchModel({ sessionID, model: body.model }) } catch {} }
-        let beforeID: string | undefined
-        try {
-          const cur: any[] = (await ctx.session.context({ sessionID })) ?? []
-          beforeID = [...cur].reverse().find((m) => m?.type === "assistant")?.id
-        } catch {}
-        // Admission errors (e.g. busy session) reject immediately.
-        await ctx.session.prompt({ sessionID, text })
-        const reply = await pollReply(sessionID, beforeID)
-        return { data: reply ? mapMessage(reply) : { info: {}, parts: [] } }
-      },
-      // V1: {path:{id}} -> {data:[{info,parts}]}. v2 context() returns the flat list.
-      async messages({ path }: any) {
-        const msgs: any[] = (await ctx.session.context({ sessionID: path.id })) ?? []
-        return { data: msgs.map(mapMessage) }
-      },
-      // V1: {body:{parentID,title}} -> {data:{id,...}}. v2 also accepts agent and
-      // model, which is how a Morty child inherits the parent's model instead of
-      // silently falling back to the global default.
-      async create({ body }: any) {
-        const created = await ctx.session.create({
-          parentID: body?.parentID,
-          title: body?.title,
-          agent: body?.agent,
-          model: body?.model,
-        })
-        // Belt and braces: if create ignored the model, switch afterwards.
-        if (created?.id && body?.model?.id && body?.model?.providerID) {
-          try { await ctx.session.switchModel({ sessionID: created.id, model: body.model }) } catch {}
-        }
-        return { data: created }
-      },
-      // V1 abort -> v2 interrupt.
-      async abort({ path }: any) {
-        await ctx.session.interrupt({ sessionID: path.id })
-      },
-    },
-  }
-}
+const JSON_EMPTY = { type: "object", properties: {}, additionalProperties: false } as const
 
 export default Plugin.define({
   id: "pickle-rick",
   async setup(ctx) {
-    const engine = createEngine({ client: makeV1Client(ctx), directory: ctx.location.directory })
+    const engine = createEngine({ client: createV1Client(ctx), directory: ctx.location.directory })
 
     // Keep the loop alive through context compaction.
     await ctx.session.hook("compaction", (event: any) => {
       const extra = engine.compactionContext(event?.sessionID)
       if (extra && Array.isArray(event?.system)) event.system.push({ type: "text", text: extra })
     })
+
+    // Refuse a start on a dirty tree unless the user asked for it: the loop writes
+    // code, and a dirty tree makes its own diffs impossible to review.
+    const dirtyGuard = (raw: string): string | undefined => {
+      if (/--allow-dirty\b/.test(raw) || /--resume\b/.test(raw)) return undefined
+      try {
+        const out = execSync("git status --porcelain", {
+          cwd: ctx.location.directory,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim()
+        if (!out) return undefined
+        const lines = out.split("\n")
+        return `🥒 Working tree is dirty (${lines.length} file${lines.length === 1 ? "" : "s"}):\n${lines.slice(0, 10).join("\n")}${lines.length > 10 ? "\n…" : ""}\nCommit or stash first, or start with \`--allow-dirty\` if this is intentional.`
+      } catch {
+        return undefined // not a git repo: nothing to guard
+      }
+    }
 
     // Register the tools. V2: JSON-Schema input, execute returns {content}.
     await ctx.tool.transform((editor: any) => {
@@ -150,18 +52,20 @@ export default Plugin.define({
           required: ["raw"],
           additionalProperties: false,
         },
-        execute: async (input: any, toolCtx: any) => ({ content: engine.startFromRaw(toolCtx.sessionID, input.raw) }),
+        execute: async (input: any, toolCtx: any) => ({
+          content: dirtyGuard(String(input.raw ?? "")) ?? engine.startFromRaw(toolCtx.sessionID, input.raw),
+        }),
       })
       editor.add({
         name: "pickle_stop",
         description: "Cancel the active Pickle Rick loop in this session (/eat-pickle).",
-        input: { type: "object", properties: {}, additionalProperties: false },
+        input: JSON_EMPTY,
         execute: async (_input: any, toolCtx: any) => ({ content: await engine.stop(toolCtx.sessionID) }),
       })
       editor.add({
         name: "pickle_status",
-        description: "Show the Pickle Rick loop state: session dir, phase, iteration, limits. Use it to find the session directory.",
-        input: { type: "object", properties: {}, additionalProperties: false },
+        description: "Show the Pickle Rick loop state: session dir, phase, iteration, limits, tokens, tickets. Use it to find the session directory.",
+        input: JSON_EMPTY,
         execute: async (_input: any, toolCtx: any) => ({ content: engine.status(toolCtx.sessionID) }),
       })
       editor.add({
@@ -197,26 +101,48 @@ export default Plugin.define({
         execute: async (input: any) => ({ content: engine.jarAdd(input.task ?? "") }),
       })
       editor.add({
+        name: "pickle_jar_list",
+        description: "List the tasks queued in the Pickle Jar (/pickle-jar-list).",
+        input: JSON_EMPTY,
+        execute: async () => ({ content: engine.jarList() }),
+      })
+      editor.add({
         name: "pickle_jar_open",
         description: "Open the Pickle Jar and run every queued task, one loop after another (/pickle-jar-open).",
-        input: { type: "object", properties: {}, additionalProperties: false },
+        input: JSON_EMPTY,
         execute: async (_input: any, toolCtx: any) => ({ content: engine.jarOpen(toolCtx.sessionID) }),
+      })
+      editor.add({
+        name: "pickle_sessions",
+        description: "List every Pickle Rick session in this project with state, phase and token usage.",
+        input: JSON_EMPTY,
+        execute: async () => ({ content: engine.listSessions() }),
+      })
+      editor.add({
+        name: "pickle_clean",
+        description: "Delete finished Pickle Rick sessions older than N days (default 7). Active loops are never removed.",
+        input: {
+          type: "object",
+          properties: { keepDays: { type: "number", description: "Keep sessions updated in the last N days (default 7)" } },
+          additionalProperties: false,
+        },
+        execute: async (input: any) => ({ content: engine.cleanSessions(input.keepDays) }),
       })
       editor.add({
         name: "pickle_send_to_morty",
         description:
-          "Spawn a Morty worker (isolated child session, own context, timeout) to implement ONE ticket. Returns Morty's report.",
+          "Spawn a Morty worker (isolated child session, own context, timeout) to implement ONE ticket. Empty ticket = next open ticket. Returns Morty's report.",
         input: {
           type: "object",
           properties: {
-            ticket: { type: "string", description: "Ticket id or filename, e.g. 003-add-dark-mode" },
+            ticket: { type: "string", description: "Ticket id or filename (e.g. 003-add-dark-mode), or empty for the next open ticket" },
             instructions: { type: "string", description: "Extra instructions for Morty: scope, constraints, verification commands" },
           },
-          required: ["ticket", "instructions"],
+          required: ["instructions"],
           additionalProperties: false,
         },
         execute: async (input: any, toolCtx: any) => ({
-          content: await engine.sendToMorty(toolCtx.sessionID, input.ticket, input.instructions),
+          content: await engine.sendToMorty(toolCtx.sessionID, input.ticket ?? "", input.instructions ?? ""),
         }),
       })
     })
@@ -249,7 +175,7 @@ export default Plugin.define({
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          const normalized = translate(event as any)
+          const normalized = translate(event)
           if (normalized) await engine.handleEvent(normalized)
         }
       } catch {
